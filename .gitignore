@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Regenerated on every run at the repo root (tracked copies live in figures/)
+/rocketsim_*.png
