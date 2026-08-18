@@ -773,19 +773,29 @@ class SimResult:
 
 
 def _refine_peak(t: np.ndarray, f: np.ndarray) -> tuple[float, float]:
-    """Parabolic refinement of a sampled maximum (keeps the optimizer's
-    max-Q constraint smooth in the design variables)."""
+    """
+    Vertex of the three-point interpolating parabola around a sampled
+    maximum (keeps the optimizer's max-Q constraint smooth in the design
+    variables). Uses the ACTUAL abscissae in Newton divided-difference form:
+    the stitched output grid is non-uniform (burn and coast phases sample at
+    different rates), and the equispaced-vertex formula overestimates peaks
+    that land on a spacing break.
+    """
     i = int(np.argmax(f))
-    if 0 < i < len(f) - 1:
-        t0, t1, t2 = t[i - 1], t[i], t[i + 1]
-        f0, f1, f2 = f[i - 1], f[i], f[i + 1]
-        denom = (f0 - 2.0 * f1 + f2)
-        if abs(denom) > 1e-12:
-            s = 0.5 * (f0 - f2) / denom
-            s = max(-1.0, min(1.0, s))
-            dt = t1 - t0
-            return t1 + s * dt, f1 - 0.25 * (f0 - f2) * s
-    return float(t[i]), float(f[i])
+    if i <= 0 or i >= len(f) - 1:
+        return float(t[i]), float(f[i])
+    t0, t1, t2 = float(t[i - 1]), float(t[i]), float(t[i + 1])
+    f0, f1, f2 = float(f[i - 1]), float(f[i]), float(f[i + 1])
+    d1 = (f1 - f0) / (t1 - t0)
+    d2 = (f2 - f1) / (t2 - t1)
+    a = (d2 - d1) / (t2 - t0)          # half the parabola's curvature
+    if a >= 0.0:                       # not concave at the sample: keep it
+        return t1, f1
+    tv = 0.5 * (t0 + t1) - d1 / (2.0 * a)
+    if not (t0 <= tv <= t2):
+        return t1, f1
+    fv = f0 + d1 * (tv - t0) + a * (tv - t0) * (tv - t1)
+    return tv, fv
 
 
 def simulate(veh: Vehicle, prm: SimParams, mode: str = "full") -> SimResult:
@@ -803,15 +813,9 @@ def simulate(veh: Vehicle, prm: SimParams, mode: str = "full") -> SimResult:
     y0 = initial_state(veh, prm, fr)
     tb = veh.t_burn
 
-    # ---- phase 1: powered ascent -----------------------------------------
-    sol1 = solve_ivp(dynamics, (0.0, tb), y0, method="RK45",
-                     t_eval=np.arange(0.0, tb + 1e-9, dt_burn),
-                     rtol=rtol, atol=_ATOL, max_step=2.0,
-                     args=(veh, prm, fr, True))
-    if not sol1.success:
-        raise RuntimeError(f"Powered-phase integration failed: {sol1.message}")
-
-    # ---- phase 2: coast / ballistic --------------------------------------
+    # Ground impact terminates EITHER phase: an aggressive in-bounds guidance
+    # probe can reach the ground during the burn, and phase 2's downward
+    # crossing detection could never fire from a below-ground handoff state.
     def ev_impact(t, y, *_):
         return math.sqrt(y[0] ** 2 + y[1] ** 2 + y[2] ** 2) - R_EARTH
     ev_impact.terminal = True
@@ -824,32 +828,52 @@ def simulate(veh: Vehicle, prm: SimParams, mode: str = "full") -> SimResult:
     ev_apogee.terminal = (mode == "apogee")
     ev_apogee.direction = -1
 
-    sol2 = solve_ivp(dynamics, (tb, prm.t_max), sol1.y[:, -1], method="RK45",
-                     t_eval=np.arange(tb, prm.t_max, dt_coast),
-                     events=(ev_impact, ev_apogee),
-                     rtol=rtol, atol=_ATOL, max_step=10.0,
-                     args=(veh, prm, fr, False))
-    if not sol2.success and sol2.status != 1:
-        raise RuntimeError(f"Coast-phase integration failed: {sol2.message}")
+    # ---- phase 1: powered ascent -----------------------------------------
+    sol1 = solve_ivp(dynamics, (0.0, tb), y0, method="RK45",
+                     t_eval=np.arange(0.0, tb + 1e-9, dt_burn),
+                     events=(ev_impact,),
+                     rtol=rtol, atol=_ATOL, max_step=2.0,
+                     args=(veh, prm, fr, True))
+    if not sol1.success and sol1.status != 1:
+        raise RuntimeError(f"Powered-phase integration failed: {sol1.message}")
 
-    # ---- stitch phases (drop duplicated t_burn sample) --------------------
-    t = np.concatenate([sol1.t, sol2.t[1:] if len(sol2.t) else []])
-    ys = np.concatenate([sol1.y, sol2.y[:, 1:]], axis=1) \
-        if sol2.y.shape[1] else sol1.y
-
-    # Append exact terminal-event states (impact, or apogee in apogee mode).
     t_impact = None
-    if len(sol2.t_events[0]):
-        t_ev = float(sol2.t_events[0][0])
-        t = np.append(t, t_ev)
-        ys = np.column_stack([ys, sol2.y_events[0][0]])
-        t_impact = t_ev
     t_apogee_ev = None
-    if len(sol2.t_events[1]):
-        t_apogee_ev = float(sol2.t_events[1][0])
-        if mode == "apogee":
-            t = np.append(t, t_apogee_ev)
-            ys = np.column_stack([ys, sol2.y_events[1][0]])
+    if len(sol1.t_events[0]):
+        # Impacted under power: no coast phase.
+        t_impact = float(sol1.t_events[0][0])
+        if t_impact > sol1.t[-1] + 1e-9:
+            t = np.append(sol1.t, t_impact)
+            ys = np.column_stack([sol1.y, sol1.y_events[0][0]])
+        else:
+            t, ys = sol1.t, sol1.y
+    else:
+        # ---- phase 2: coast / ballistic ----------------------------------
+        sol2 = solve_ivp(dynamics, (tb, prm.t_max), sol1.y[:, -1],
+                         method="RK45",
+                         t_eval=np.arange(tb, prm.t_max, dt_coast),
+                         events=(ev_impact, ev_apogee),
+                         rtol=rtol, atol=_ATOL, max_step=10.0,
+                         args=(veh, prm, fr, False))
+        if not sol2.success and sol2.status != 1:
+            raise RuntimeError(f"Coast-phase integration failed: {sol2.message}")
+
+        # ---- stitch phases (drop duplicated t_burn sample) ----------------
+        t = np.concatenate([sol1.t, sol2.t[1:] if len(sol2.t) else []])
+        ys = np.concatenate([sol1.y, sol2.y[:, 1:]], axis=1) \
+            if sol2.y.shape[1] else sol1.y
+
+        # Append exact terminal-event states (impact / apogee-mode apogee).
+        if len(sol2.t_events[0]):
+            t_ev = float(sol2.t_events[0][0])
+            t = np.append(t, t_ev)
+            ys = np.column_stack([ys, sol2.y_events[0][0]])
+            t_impact = t_ev
+        if len(sol2.t_events[1]):
+            t_apogee_ev = float(sol2.t_events[1][0])
+            if mode == "apogee":
+                t = np.append(t, t_apogee_ev)
+                ys = np.column_stack([ys, sol2.y_events[1][0]])
 
     # ---- basic kinematic telemetry ---------------------------------------
     n = len(t)
@@ -874,13 +898,17 @@ def simulate(veh: Vehicle, prm: SimParams, mode: str = "full") -> SimResult:
         q_dyn[k] = 0.5 * rho_k * v_air * v_air
         mach_arr[k] = v_air / a_k
 
-    # Apogee: exact event when recorded, else best sample.
+    # Apogee: start from the global sample maximum; the coast-phase event may
+    # REFINE it but never undercut it. (An aggressive pitchover can peak
+    # during the burn -- where no event is attached -- then descend; a later,
+    # lower radial-velocity zero-crossing must not be reported as apogee.)
+    i_apo = int(np.argmax(alt))
+    t_apo, apo = float(t[i_apo]), float(alt[i_apo])
     if t_apogee_ev is not None:
-        t_apo = t_apogee_ev
-        apo = float(np.interp(t_apo, t, alt)) if mode != "apogee" else float(alt[-1])
-    else:
-        i_apo = int(np.argmax(alt))
-        t_apo, apo = float(t[i_apo]), float(alt[i_apo])
+        apo_ev = float(alt[-1]) if mode == "apogee" \
+            else float(np.interp(t_apogee_ev, t, alt))
+        if apo_ev >= apo:
+            t_apo, apo = t_apogee_ev, apo_ev
 
     # Max-Q is an ASCENT (boost-phase) structural metric; the ballistic
     # return re-enters at high Mach and its far larger Q peak is reported
